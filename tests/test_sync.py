@@ -816,6 +816,33 @@ def test_native_prompt_progress_is_silent_on_terminal(monkeypatch, vlm_model):
     assert terminal.getvalue() == ""
 
 
+def test_native_http_error_reports_lm_studio_message(monkeypatch, vlm_model):
+    monkeypatch.setattr(vlm_model, "_is_model_loaded", lambda: True)
+    http_response = llm_lmstudio.requests.Response()
+    http_response.status_code = 400
+    http_response.url = "http://localhost:1234/api/v1/chat"
+    http_response._content = json.dumps(
+        {
+            "error": {
+                "message": "Reasoning setting 'high' is not supported. Supported settings: 'off', 'on'.",
+                "code": "invalid_value",
+            }
+        }
+    ).encode()
+    monkeypatch.setattr(
+        llm_lmstudio.requests, "post", lambda *args, **kwargs: http_response
+    )
+    prompt = SimpleNamespace(
+        messages=[llm.user("Hello")],
+        options=vlm_model.Options(reasoning="high"),
+        schema=None,
+        tools=[],
+    )
+
+    with pytest.raises(llm.ModelError, match="Supported settings: 'off', 'on'"):
+        list(vlm_model.execute(prompt, True, MagicMock()))
+
+
 def test_prepare_chat_request_for_schema_forces_non_streaming(
     vlm_model, mock_prompt_factory
 ):

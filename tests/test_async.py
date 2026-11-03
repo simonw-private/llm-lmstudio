@@ -347,3 +347,45 @@ async def test_async_execute_handles_tool_call_response(monkeypatch):
     assert sent_tools[0]["function"]["parameters"]["required"] == ["location"]
     final_message = request_json["messages"][-1]
     assert final_message["content"] == "Please check the weather in Berlin."
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_async_http_error_reports_lm_studio_message(monkeypatch, stream):
+    monkeypatch.setattr(
+        llm_lmstudio.LMStudioAsyncModel, "_is_model_loaded", lambda self: True
+    )
+
+    async def handler(request):
+        return llm_lmstudio.httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Reasoning setting 'high' is not supported. Supported settings: 'off', 'on'.",
+                    "code": "invalid_value",
+                }
+            },
+        )
+
+    transport = llm_lmstudio.httpx.MockTransport(handler)
+    async_client_class = llm_lmstudio.httpx.AsyncClient
+    monkeypatch.setattr(
+        llm_lmstudio.httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client_class(transport=transport, **kwargs),
+    )
+    model = llm_lmstudio.LMStudioAsyncModel(
+        model_id="lmstudio/test",
+        base_url="http://localhost:1234",
+        raw_id="test-model",
+        api_path_prefix="/api/v0",
+    )
+    prompt = llm.Prompt(
+        "Hello",
+        model,
+        messages=[llm.user("Hello")],
+        options=model.Options(reasoning="high"),
+    )
+
+    with pytest.raises(llm.ModelError, match="Supported settings: 'off', 'on'"):
+        async for _ in model.execute(prompt, stream, MagicMock(), None):
+            pass

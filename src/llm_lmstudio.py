@@ -50,6 +50,30 @@ def _debug(message: str) -> None:
         print(message, file=sys.stderr)
 
 
+def _server_error(response) -> tuple[str | None, str | None]:
+    """Extract a useful message and code from an LM Studio HTTP error."""
+    if response is None:
+        return None, None
+    try:
+        payload = response.json()
+    except ValueError:
+        return None, None
+    if not isinstance(payload, dict):
+        return None, None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        message = error.get("message")
+        code = error.get("code")
+        return (
+            message if isinstance(message, str) and message else None,
+            code if isinstance(code, str) else None,
+        )
+    if isinstance(error, str) and error:
+        return error, None
+    message = payload.get("message")
+    return (message if isinstance(message, str) and message else None, None)
+
+
 def _fetch_models(base: str) -> tuple[list[dict[str, Any]], str]:
     """Return cached metadata and API path prefix for one LM Studio server."""
     if base in _cache:
@@ -1026,27 +1050,17 @@ class LMStudioModel(LMStudioBaseModel, llm.Model):
                     f"LM Studio request timed out after {request.timeout} seconds. "
                     f"Try increasing LMSTUDIO_TIMEOUT environment variable or using a faster model."
                 )
-        except requests.RequestException as e:
-            is_model_not_found = False
-            try:
-                if e.response is not None:
-                    err_data = e.response.json()
-                    if (
-                        isinstance(err_data, dict)
-                        and err_data.get("error", {}).get("code") == "model_not_found"
-                    ):
-                        is_model_not_found = True
-            except (requests.exceptions.JSONDecodeError, AttributeError) as parse_error:
-                _debug(
-                    f"LMSTUDIO DEBUG: Could not parse LM Studio error response: {parse_error}"
-                )
-
-            if is_model_not_found:
+        except requests.HTTPError as e:
+            message, code = _server_error(e.response)
+            if code == "model_not_found":
                 raise llm.ModelError(
                     f"Model '{self.raw_id}' not found by LM Studio server at {request.url}, even after attempting auto-load. Is it correctly specified and loadable?"
-                )
-            else:
-                raise llm.ModelError(f"LM Studio request failed: {e}")
+                ) from e
+            if message:
+                raise llm.ModelError(f"LM Studio request failed: {message}") from e
+            raise llm.ModelError(f"LM Studio request failed: {e}") from e
+        except requests.RequestException as e:
+            raise llm.ModelError(f"LM Studio request failed: {e}") from e
         # --- End Execute API Call --- #
 
         # --- Process Response --- #
@@ -1125,6 +1139,8 @@ class LMStudioAsyncModel(LMStudioBaseModel, llm.AsyncModel):
                     async with client.stream(
                         "POST", request.url, json=request.payload
                     ) as r:
+                        if r.is_error:
+                            await r.aread()
                         r.raise_for_status()
                         state = NativeStreamState() if request.native else StreamState()
                         async for line in r.aiter_lines():
@@ -1179,9 +1195,17 @@ class LMStudioAsyncModel(LMStudioBaseModel, llm.AsyncModel):
                     f"LM Studio async request timed out after {request.timeout} seconds. "
                     f"Try increasing LMSTUDIO_TIMEOUT environment variable."
                 )
+        except httpx.HTTPStatusError as e:
+            message, code = _server_error(e.response)
+            if code == "model_not_found":
+                raise llm.ModelError(
+                    f"Model '{self.raw_id}' not found by LM Studio server at {request.url}, even after attempting auto-load. Is it correctly specified and loadable?"
+                ) from e
+            if message:
+                raise llm.ModelError(f"LM Studio async request failed: {message}") from e
+            raise llm.ModelError(f"LM Studio async request failed: {e}") from e
         except httpx.RequestError as e:
-            # Basic error handling, could be refined like the sync version
-            raise llm.ModelError(f"LM Studio async request failed: {e}")
+            raise llm.ModelError(f"LM Studio async request failed: {e}") from e
 
 
 # ------------------------  Embedding  ------------------------------------- #
