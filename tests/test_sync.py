@@ -691,6 +691,7 @@ def test_native_request_maps_system_image_and_options(
         "temperature": 0.2,
         "top_p": 0.8,
         "max_tokens": 25,
+        "reasoning": "off",
     }
 
     request = vlm_model._prepare_chat_request(prompt, stream=False)
@@ -706,6 +707,7 @@ def test_native_request_maps_system_image_and_options(
         "temperature": 0.2,
         "top_p": 0.8,
         "max_output_tokens": 25,
+        "reasoning": "off",
         "stream": False,
         "store": False,
     }
@@ -733,6 +735,11 @@ def test_conversation_and_stop_option_keep_chat_completions(
     request = vlm_model._prepare_chat_request(prompt, stream=True)
     assert request.native is False
     assert request.payload["temperature"] == 1.5
+
+    prompt.messages = [llm.user("Hello"), llm.assistant("Hi"), llm.user("Continue")]
+    prompt.options.model_dump.return_value = {"reasoning": "off"}
+    with pytest.raises(llm.ModelError, match="single-turn native chat"):
+        vlm_model._prepare_chat_request(prompt, stream=True)
 
 
 def test_native_non_streaming_response_records_output_and_usage(monkeypatch, vlm_model):

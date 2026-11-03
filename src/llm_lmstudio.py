@@ -299,6 +299,9 @@ class LMStudioBaseModel:
         top_p: float | None = Field(None, description="Nucleus sampling")
         max_tokens: int | None = Field(None, description="Maximum tokens")
         stop: list[str] | None = Field(None, description="Stop sequences")
+        reasoning: str | None = Field(
+            None, description="Reasoning mode supported by the selected LM Studio model"
+        )
 
     def _prepare_chat_request(
         self,
@@ -312,7 +315,12 @@ class LMStudioBaseModel:
         options = prompt.options.model_dump(exclude_none=True) if prompt.options else {}
 
         native_input = self._native_input(messages)
-        native_options = options.keys() <= {"temperature", "top_p", "max_tokens"}
+        native_options = options.keys() <= {
+            "temperature",
+            "top_p",
+            "max_tokens",
+            "reasoning",
+        }
         temperature = options.get("temperature")
         native_temperature = temperature is None or 0 <= temperature <= 1
         if (
@@ -336,12 +344,21 @@ class LMStudioBaseModel:
                     payload[key] = options[key]
             if "max_tokens" in options:
                 payload["max_output_tokens"] = options["max_tokens"]
+            if "reasoning" in options:
+                payload["reasoning"] = options["reasoning"]
             return ChatRequest(
                 url=f"{self.base}/api/v1/chat",
                 payload=payload,
                 stream=stream,
                 timeout=TIMEOUT,
                 native=True,
+            )
+
+        if "reasoning" in options:
+            raise llm.ModelError(
+                "The reasoning option requires a single-turn native chat request; "
+                "it cannot be combined with conversation history, tools, schemas, "
+                "stop sequences, or unsupported native options."
             )
 
         url = (
