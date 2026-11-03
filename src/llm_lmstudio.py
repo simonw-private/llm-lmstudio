@@ -260,8 +260,6 @@ class StreamState:
 @dataclass
 class NativeStreamState:
     result: dict[str, Any] | None = None
-    progress_visible: bool = False
-    last_percent: int = -1
 
 
 class LMStudioBaseModel:
@@ -796,24 +794,7 @@ class LMStudioBaseModel:
             return
 
         event_type = event.get("type")
-        if event_type == "prompt_processing.progress":
-            progress = event.get("progress")
-            if isinstance(progress, int | float) and 0 <= progress <= 1:
-                percent = int(progress * 100)
-                if sys.stderr.isatty() and percent > state.last_percent:
-                    print(
-                        f"\rLM Studio: processing prompt {percent}%",
-                        end="",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    state.progress_visible = True
-                    state.last_percent = percent
-        elif event_type == "prompt_processing.end":
-            if state.progress_visible:
-                print(file=sys.stderr)
-                state.progress_visible = False
-        elif event_type == "reasoning.delta":
+        if event_type == "reasoning.delta":
             content = event.get("content")
             if isinstance(content, str) and content:
                 yield StreamEvent(type="reasoning", chunk=content)
@@ -832,8 +813,6 @@ class LMStudioBaseModel:
                 state.result = result
 
     def _finalize_native_stream(self, response, state: NativeStreamState) -> None:
-        if state.progress_visible:
-            print(file=sys.stderr)
         if state.result is None:
             raise llm.ModelError("LM Studio native chat stream ended without chat.end")
         self._set_native_metadata(response, state.result)

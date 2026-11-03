@@ -784,7 +784,7 @@ def test_native_stream_error_is_reported(vlm_model):
         )
 
 
-def test_native_prompt_progress_is_visible_on_terminal(monkeypatch, vlm_model):
+def test_native_prompt_progress_is_silent_on_terminal(monkeypatch, vlm_model):
     class Terminal(io.StringIO):
         def isatty(self):
             return True
@@ -806,9 +806,7 @@ def test_native_prompt_progress_is_visible_on_terminal(monkeypatch, vlm_model):
         )
     )
 
-    assert terminal.getvalue().count("50%") == 1
-    assert "100%" in terminal.getvalue()
-    assert terminal.getvalue().endswith("\n")
+    assert terminal.getvalue() == ""
 
 
 def test_prepare_chat_request_for_schema_forces_non_streaming(
