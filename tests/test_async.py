@@ -77,8 +77,9 @@ async def test_get_async_model(mock_fetch_list):
 @pytest.mark.vcr(record_mode="once")  # CHANGED from 'all' to 'once'
 @patch("llm_lmstudio.LMStudioAsyncModel._is_model_loaded", return_value=True)
 @patch("llm_lmstudio._fetch_models", return_value=MOCK_FETCH_MODELS_RETURN_VALUE)
-async def test_async_prompt_non_streaming(mock_fetch_list, mock_is_loaded):
+async def test_async_prompt_non_streaming(mock_fetch_list, mock_is_loaded, monkeypatch):
     """Test a basic non-streaming async prompt using model.response()."""
+    monkeypatch.setattr(llm_lmstudio.LMStudioBaseModel, "_native_input", lambda self, messages: None)
     model = llm.get_async_model(MODEL_ID)
     assert model is not None
     prompt_text = "Say hello"
@@ -98,8 +99,9 @@ async def test_async_prompt_non_streaming(mock_fetch_list, mock_is_loaded):
 @pytest.mark.vcr(record_mode="once")  # CHANGED from 'all' to 'once'
 @patch("llm_lmstudio.LMStudioAsyncModel._is_model_loaded", return_value=True)
 @patch("llm_lmstudio._fetch_models", return_value=MOCK_FETCH_MODELS_RETURN_VALUE)
-async def test_async_prompt_streaming(mock_fetch_list, mock_is_loaded):
+async def test_async_prompt_streaming(mock_fetch_list, mock_is_loaded, monkeypatch):
     """Test a basic streaming async prompt using model.response()."""
+    monkeypatch.setattr(llm_lmstudio.LMStudioBaseModel, "_native_input", lambda self, messages: None)
     model = llm.get_async_model(MODEL_ID)
     assert model is not None
     prompt_text = "Tell a short story."
@@ -166,10 +168,10 @@ async def test_async_execute_streams_events_and_records_usage(monkeypatch):
     )
 
     lines = [
-        'data: {"model":"resolved-model","choices":[{"delta":{"reasoning_content":"Thinking"}}]}',
-        'data: {"choices":[{"delta":{"content":"Done"}}]}',
-        'data: {"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}',
-        "data: [DONE]",
+        'event: prompt_processing.progress\ndata: {"type":"prompt_processing.progress","progress":0.5}',
+        'event: reasoning.delta\ndata: {"type":"reasoning.delta","content":"Thinking"}',
+        'event: message.delta\ndata: {"type":"message.delta","content":"Done"}',
+        'event: chat.end\ndata: {"type":"chat.end","result":{"model_instance_id":"resolved-model","output":[{"type":"reasoning","content":"Thinking"},{"type":"message","content":"Done"}],"stats":{"input_tokens":42,"total_output_tokens":5,"reasoning_output_tokens":1}}}',
     ]
     captured = {}
 
@@ -225,18 +227,16 @@ async def test_async_execute_streams_events_and_records_usage(monkeypatch):
     assert captured["client_kwargs"] == {"timeout": llm_lmstudio.TIMEOUT}
     request = captured["request"]
     assert request.method == "POST"
-    assert str(request.url) == "http://localhost:1234/api/v0/chat/completions"
+    assert str(request.url) == "http://localhost:1234/api/v1/chat"
     assert json.loads(request.content) == {
         "model": "test-model",
-        "messages": [{"role": "user", "content": "Hello"}],
+        "input": "Hello",
         "stream": True,
-        "stream_options": {"include_usage": True},
+        "store": False,
     }
-    assert response.response_json == {
-        "chunks": [json.loads(line[5:]) for line in lines[:-1]]
-    }
+    assert response.response_json["model_instance_id"] == "resolved-model"
     response.set_resolved_model.assert_called_once_with("resolved-model")
-    response.set_usage.assert_called_once_with(input=42, output=5, details=None)
+    response.set_usage.assert_called_once_with(input=42, output=5, details={"reasoning_output_tokens": 1})
 
 
 async def test_async_execute_handles_tool_call_response(monkeypatch):
@@ -347,3 +347,45 @@ async def test_async_execute_handles_tool_call_response(monkeypatch):
     assert sent_tools[0]["function"]["parameters"]["required"] == ["location"]
     final_message = request_json["messages"][-1]
     assert final_message["content"] == "Please check the weather in Berlin."
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_async_http_error_reports_lm_studio_message(monkeypatch, stream):
+    monkeypatch.setattr(
+        llm_lmstudio.LMStudioAsyncModel, "_is_model_loaded", lambda self: True
+    )
+
+    async def handler(request):
+        return llm_lmstudio.httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "Reasoning setting 'high' is not supported. Supported settings: 'off', 'on'.",
+                    "code": "invalid_value",
+                }
+            },
+        )
+
+    transport = llm_lmstudio.httpx.MockTransport(handler)
+    async_client_class = llm_lmstudio.httpx.AsyncClient
+    monkeypatch.setattr(
+        llm_lmstudio.httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client_class(transport=transport, **kwargs),
+    )
+    model = llm_lmstudio.LMStudioAsyncModel(
+        model_id="lmstudio/test",
+        base_url="http://localhost:1234",
+        raw_id="test-model",
+        api_path_prefix="/api/v0",
+    )
+    prompt = llm.Prompt(
+        "Hello",
+        model,
+        messages=[llm.user("Hello")],
+        options=model.Options(reasoning="high"),
+    )
+
+    with pytest.raises(llm.ModelError, match="Supported settings: 'off', 'on'"):
+        async for _ in model.execute(prompt, stream, MagicMock(), None):
+            pass

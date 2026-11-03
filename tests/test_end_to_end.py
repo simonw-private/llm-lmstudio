@@ -37,7 +37,8 @@ def vcr_cassette_dir(request):
 
 
 @pytest.mark.vcr(record_mode="once")
-def test_lmstudio_sync_prompt_round_trip():
+def test_lmstudio_sync_prompt_round_trip(monkeypatch):
+    monkeypatch.setattr(llm_lmstudio.LMStudioBaseModel, "_native_input", lambda self, messages: None)
     model_id = os.getenv("LMSTUDIO_TEST_MODEL_ID", "lmstudio/qwen3-4b")
     prompt_text = "Give me a cheerful greeting in one sentence."
 
@@ -68,7 +69,8 @@ def test_lmstudio_sync_prompt_round_trip():
 
 @pytest.mark.asyncio
 @pytest.mark.vcr(record_mode="once")
-async def test_lmstudio_async_prompt_round_trip():
+async def test_lmstudio_async_prompt_round_trip(monkeypatch):
+    monkeypatch.setattr(llm_lmstudio.LMStudioBaseModel, "_native_input", lambda self, messages: None)
     model_id = os.getenv("LMSTUDIO_TEST_MODEL_ID", "lmstudio/qwen3-4b")
     prompt_text = "Give me a cheerful greeting in one sentence."
 
