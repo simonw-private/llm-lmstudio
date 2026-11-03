@@ -44,6 +44,8 @@ To run a prompt against a model:
 llm -m lmstudio/your-model-id -o temperature 0.7 -o max_tokens 100 "Tell me a joke"
 ```
 
+Single-turn prompts use LM Studio's native `/api/v1/chat` endpoint. Its streaming response includes prompt-processing progress, which keeps long prompts active during prefill; interactive terminals also show the percentage on stderr. Structured output, custom tools, continued conversations, and the `stop` option use the chat-completions endpoint because the native endpoint cannot represent those requests without changing their behavior. Use `LMSTUDIO_TIMEOUT` to increase the inactivity timeout for requests that do not receive progress events, including `--no-stream` calls.
+
 To start an interactive chat session:
 
 ```bash
@@ -164,6 +166,6 @@ The asynchronous tests in `tests/test_llm_lmstudio_async.py` (among others) use 
 
 ## Future work
 
-- Add server-side tool support through LM Studio's `/api/v1/chat` or `/v1/responses` endpoint. The current `/v1/chat/completions` integration supports custom tools only. Community contributions are welcome.
+- Add server-side tool support through LM Studio's `/api/v1/chat` or `/v1/responses` endpoint. The chat-completions fallback supports custom tools only. Community contributions are welcome.
 - Migrate `manual-testing.md` to an opt-in Pytest acceptance suite that runs against a live LM Studio server. Keep these slower tests out of normal `pytest` runs.
 

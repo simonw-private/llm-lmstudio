@@ -247,6 +247,7 @@ class ChatRequest:
     payload: dict[str, Any]
     stream: bool
     timeout: float
+    native: bool = False
 
 
 @dataclass
@@ -254,6 +255,13 @@ class StreamState:
     chunks: list[dict[str, Any]] = field(default_factory=list)
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     usage: dict[str, Any] | None = None
+
+
+@dataclass
+class NativeStreamState:
+    result: dict[str, Any] | None = None
+    progress_visible: bool = False
+    last_percent: int = -1
 
 
 class LMStudioBaseModel:
@@ -302,6 +310,41 @@ class LMStudioBaseModel:
     ) -> ChatRequest:
         has_schema = bool(getattr(prompt, "schema", None))
         has_tools = bool(getattr(prompt, "tools", None))
+        messages = self._build_messages(prompt, conversation)
+        options = prompt.options.model_dump(exclude_none=True) if prompt.options else {}
+
+        native_input = self._native_input(messages)
+        native_options = options.keys() <= {"temperature", "top_p", "max_tokens"}
+        temperature = options.get("temperature")
+        native_temperature = temperature is None or 0 <= temperature <= 1
+        if (
+            not has_schema
+            and not has_tools
+            and native_options
+            and native_temperature
+            and native_input
+        ):
+            input_value, system_prompt = native_input
+            payload: dict[str, Any] = {
+                "model": self.raw_id,
+                "input": input_value,
+                "stream": stream,
+                "store": False,
+            }
+            if system_prompt:
+                payload["system_prompt"] = system_prompt
+            for key in ("temperature", "top_p"):
+                if key in options:
+                    payload[key] = options[key]
+            if "max_tokens" in options:
+                payload["max_output_tokens"] = options["max_tokens"]
+            return ChatRequest(
+                url=f"{self.base}/api/v1/chat",
+                payload=payload,
+                stream=stream,
+                timeout=TIMEOUT,
+                native=True,
+            )
 
         url = (
             f"{self.base}/v1/chat/completions"
@@ -310,14 +353,13 @@ class LMStudioBaseModel:
         )
         payload: dict[str, Any] = {
             "model": self.raw_id,
-            "messages": self._build_messages(prompt, conversation),
+            "messages": messages,
         }
 
         if has_tools:
             payload["tools"] = self._encode_tools(prompt.tools)
 
-        if prompt.options:
-            payload.update(prompt.options.model_dump(exclude_none=True))
+        payload.update(options)
 
         if has_schema:
             payload["response_format"] = {
@@ -345,6 +387,41 @@ class LMStudioBaseModel:
             stream=stream,
             timeout=timeout,
         )
+
+    def _native_input(
+        self, messages: list[dict]
+    ) -> tuple[str | list[dict], str | None] | None:
+        """Use native chat only for a single user turn it can represent exactly."""
+        if len(messages) == 2 and [item["role"] for item in messages] == [
+            "system",
+            "user",
+        ]:
+            system_prompt = messages[0]["content"]
+            user_message = messages[1]
+        elif len(messages) == 1 and messages[0]["role"] == "user":
+            system_prompt = None
+            user_message = messages[0]
+        else:
+            return None
+
+        if not isinstance(system_prompt, (str, type(None))):
+            return None
+        content = user_message["content"]
+        if isinstance(content, str):
+            return content, system_prompt
+        if not isinstance(content, list):
+            return None
+        native_parts = []
+        for part in content:
+            if part.get("type") == "text":
+                native_parts.append({"type": "text", "content": part["text"]})
+            elif part.get("type") == "image_url":
+                native_parts.append(
+                    {"type": "image", "data_url": part["image_url"]["url"]}
+                )
+            else:
+                return None
+        return native_parts, system_prompt
 
     def __str__(self):
         """Return the model ID with its display suffix for listings."""
@@ -676,6 +753,91 @@ class LMStudioBaseModel:
             details=details or None,
         )
 
+    def _set_native_metadata(self, response, payload: dict[str, Any]) -> None:
+        response.response_json = payload
+        model = payload.get("model_instance_id")
+        if model:
+            response.set_resolved_model(model)
+        stats = payload.get("stats") or {}
+        if stats:
+            response.set_usage(
+                input=stats.get("input_tokens"),
+                output=stats.get("total_output_tokens"),
+                details={
+                    "reasoning_output_tokens": stats["reasoning_output_tokens"]
+                }
+                if "reasoning_output_tokens" in stats
+                else None,
+            )
+
+    def _process_native_response(
+        self, response, payload: dict[str, Any]
+    ) -> Iterator[StreamEvent]:
+        self._set_native_metadata(response, payload)
+        for item in payload.get("output", []):
+            content = item.get("content")
+            if isinstance(content, str) and content:
+                if item.get("type") == "reasoning":
+                    yield StreamEvent(type="reasoning", chunk=content)
+                elif item.get("type") == "message":
+                    yield StreamEvent(type="text", chunk=content)
+
+    def _process_native_stream_line(
+        self, line: str, state: NativeStreamState
+    ) -> Iterator[StreamEvent]:
+        if not line.startswith("data:"):
+            return
+        try:
+            event = json.loads(line[5:].strip())
+        except json.JSONDecodeError as e:
+            _debug(f"LMSTUDIO DEBUG: Ignoring malformed native stream JSON: {e}")
+            return
+        if not isinstance(event, dict):
+            return
+
+        event_type = event.get("type")
+        if event_type == "prompt_processing.progress":
+            progress = event.get("progress")
+            if isinstance(progress, int | float) and 0 <= progress <= 1:
+                percent = int(progress * 100)
+                if sys.stderr.isatty() and percent > state.last_percent:
+                    print(
+                        f"\rLM Studio: processing prompt {percent}%",
+                        end="",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    state.progress_visible = True
+                    state.last_percent = percent
+        elif event_type == "prompt_processing.end":
+            if state.progress_visible:
+                print(file=sys.stderr)
+                state.progress_visible = False
+        elif event_type == "reasoning.delta":
+            content = event.get("content")
+            if isinstance(content, str) and content:
+                yield StreamEvent(type="reasoning", chunk=content)
+        elif event_type == "message.delta":
+            content = event.get("content")
+            if isinstance(content, str) and content:
+                yield StreamEvent(type="text", chunk=content)
+        elif event_type == "error":
+            error = event.get("error") or {}
+            raise llm.ModelError(
+                f"LM Studio native chat failed: {error.get('message', error)}"
+            )
+        elif event_type == "chat.end":
+            result = event.get("result")
+            if isinstance(result, dict):
+                state.result = result
+
+    def _finalize_native_stream(self, response, state: NativeStreamState) -> None:
+        if state.progress_visible:
+            print(file=sys.stderr)
+        if state.result is None:
+            raise llm.ModelError("LM Studio native chat stream ended without chat.end")
+        self._set_native_metadata(response, state.result)
+
     def _process_non_streaming_response(
         self,
         response,
@@ -892,32 +1054,45 @@ class LMStudioModel(LMStudioBaseModel, llm.Model):
         # --- End Execute API Call --- #
 
         # --- Process Response --- #
-        if stream:
-            state = StreamState()
-            for line in r.iter_lines():
+        try:
+            if stream:
+                state = NativeStreamState() if request.native else StreamState()
+                # A native progress event may be much smaller than requests'
+                # default 512-byte chunk, so read each line promptly.
+                lines = r.iter_lines(chunk_size=1 if request.native else 512)
+                for line in lines:
+                    try:
+                        decoded_line = line.decode("utf-8")
+                    except UnicodeDecodeError as e:
+                        _debug(
+                            f"LMSTUDIO DEBUG: Ignoring invalid UTF-8 stream line: {e}"
+                        )
+                        continue
+                    if request.native:
+                        yield from self._process_native_stream_line(decoded_line, state)
+                    else:
+                        yield from self._process_stream_line(decoded_line, state)
+                if request.native:
+                    self._finalize_native_stream(response, state)
+                else:
+                    yield from self._finalize_stream(response, state)
+            else:
                 try:
-                    decoded_line = line.decode("utf-8")
-                except UnicodeDecodeError as e:
-                    _debug(
-                        f"LMSTUDIO DEBUG: Ignoring invalid UTF-8 stream line: {e}"
-                    )
-                    continue
-                yield from self._process_stream_line(decoded_line, state)
-            yield from self._finalize_stream(response, state)
-
-        else:  # Non-streaming
-            try:
-                raw_text = r.text  # Get raw text first
-                res = r.json()
-            except json.JSONDecodeError as e:
-                print(
-                    f"LMSTUDIO ERROR: Failed to decode JSON response: {e}",
-                    file=sys.stderr,
-                )
-                _debug(f"LMSTUDIO DEBUG: Failing raw text was: {raw_text}")
-                raise llm.ModelError("Failed to decode JSON response from LM Studio.")
-
-            yield from self._process_non_streaming_response(response, res)
+                    res = r.json()
+                except json.JSONDecodeError as e:
+                    raise llm.ModelError(
+                        f"Failed to decode JSON response from LM Studio: {e}"
+                    ) from e
+                if request.native:
+                    yield from self._process_native_response(response, res)
+                else:
+                    yield from self._process_non_streaming_response(response, res)
+        except requests.exceptions.Timeout as e:
+            raise llm.ModelError(
+                f"LM Studio response timed out after {request.timeout} seconds of inactivity"
+            ) from e
+        finally:
+            r.close()
 
         # --- End Process Response --- #
 
@@ -955,12 +1130,20 @@ class LMStudioAsyncModel(LMStudioBaseModel, llm.AsyncModel):
                         "POST", request.url, json=request.payload
                     ) as r:
                         r.raise_for_status()
-                        state = StreamState()
+                        state = NativeStreamState() if request.native else StreamState()
                         async for line in r.aiter_lines():
-                            for event in self._process_stream_line(line, state):
+                            events = (
+                                self._process_native_stream_line(line, state)
+                                if request.native
+                                else self._process_stream_line(line, state)
+                            )
+                            for event in events:
                                 yield event
-                        for event in self._finalize_stream(response, state):
-                            yield event
+                        if request.native:
+                            self._finalize_native_stream(response, state)
+                        else:
+                            for event in self._finalize_stream(response, state):
+                                yield event
 
                 else:  # Non-streaming async
                     r = await client.post(request.url, json=request.payload)
@@ -980,7 +1163,12 @@ class LMStudioAsyncModel(LMStudioBaseModel, llm.AsyncModel):
                             "Failed to decode JSON response from LM Studio."
                         )
 
-                    for event in self._process_non_streaming_response(response, res):
+                    events = (
+                        self._process_native_response(response, res)
+                        if request.native
+                        else self._process_non_streaming_response(response, res)
+                    )
+                    for event in events:
                         yield event
 
         except httpx.TimeoutException:

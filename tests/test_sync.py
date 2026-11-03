@@ -1,3 +1,4 @@
+import io
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -500,19 +501,24 @@ def test_sync_stream_ignores_invalid_utf8_and_recovers(
         llm_lmstudio.LMStudioModel, "_is_model_loaded", lambda self: True
     )
 
+    chunk_sizes = []
+
     class StreamResponse:
         def raise_for_status(self):
             return None
 
-        def iter_lines(self):
+        def iter_lines(self, chunk_size=None):
+            chunk_sizes.append(chunk_size)
             return iter(
                 [
-                    b'data: {"choices":[{"delta":{"content":"bad \xff"}}]}',
-                    b'data: {"model":"resolved-model","choices":[{"delta":{"content":"Recovered"}}]}',
-                    b'data: {"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":5}}',
-                    b"data: [DONE]",
+                    b'data: {"type":"message.delta","content":"bad \xff"}',
+                    b'data: {"type":"message.delta","content":"Recovered"}',
+                    b'data: {"type":"chat.end","result":{"model_instance_id":"resolved-model","output":[{"type":"message","content":"Recovered"}],"stats":{"input_tokens":42,"total_output_tokens":5}}}',
                 ]
             )
+
+        def close(self):
+            pass
 
     monkeypatch.setattr(
         llm_lmstudio.requests,
@@ -539,6 +545,7 @@ def test_sync_stream_ignores_invalid_utf8_and_recovers(
     assert [(event.type, event.chunk) for event in events] == [
         ("text", "Recovered")
     ]
+    assert chunk_sizes == [1]
     assert "Ignoring invalid UTF-8 stream line" in capsys.readouterr().err
     response.set_resolved_model.assert_called_once_with("resolved-model")
     response.set_usage.assert_called_once_with(input=42, output=5, details=None)
@@ -580,6 +587,9 @@ def test_execute_handles_tool_call_response(monkeypatch, vlm_model):
 
         def json(self):
             return self._payload
+
+        def close(self):
+            pass
 
     last_request = {}
 
@@ -655,15 +665,150 @@ def test_prepare_chat_request_for_streaming(vlm_model, mock_prompt_factory):
 
     request = vlm_model._prepare_chat_request(prompt, stream=True)
 
-    assert request.url == "http://localhost:1234/v1/chat/completions"
+    assert request.url == "http://localhost:1234/api/v1/chat"
+    assert request.native is True
     assert request.stream is True
     assert request.timeout == llm_lmstudio.TIMEOUT
     assert request.payload == {
         "model": "test-vlm-raw-id",
-        "messages": [{"role": "user", "content": "Hello"}],
+        "input": "Hello",
         "stream": True,
-        "stream_options": {"include_usage": True},
+        "store": False,
     }
+
+
+def test_native_request_maps_system_image_and_options(
+    vlm_model, mock_prompt_factory, mock_attachment_factory
+):
+    prompt = mock_prompt_factory(
+        prompt_text="Describe this",
+        attachments=[mock_attachment_factory()],
+        system_prompt="Be concise",
+    )
+    prompt.schema = None
+    prompt.tools = []
+    prompt.options.model_dump.return_value = {
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "max_tokens": 25,
+    }
+
+    request = vlm_model._prepare_chat_request(prompt, stream=False)
+
+    assert request.native is True
+    assert request.payload == {
+        "model": "test-vlm-raw-id",
+        "input": [
+            {"type": "text", "content": "Describe this"},
+            {"type": "image", "data_url": "data:image/png;base64,dGVzdA=="},
+        ],
+        "system_prompt": "Be concise",
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "max_output_tokens": 25,
+        "stream": False,
+        "store": False,
+    }
+
+
+def test_conversation_and_stop_option_keep_chat_completions(
+    vlm_model, mock_prompt_factory
+):
+    prompt = mock_prompt_factory(prompt_text="Continue")
+    prompt.schema = None
+    prompt.tools = []
+    prompt.messages = [llm.user("Hello"), llm.assistant("Hi"), llm.user("Continue")]
+
+    request = vlm_model._prepare_chat_request(prompt, stream=True)
+    assert request.native is False
+    assert request.url == "http://localhost:1234/v1/chat/completions"
+
+    prompt.messages = [llm.user("Stop here")]
+    prompt.options.model_dump.return_value = {"stop": ["here"]}
+    request = vlm_model._prepare_chat_request(prompt, stream=True)
+    assert request.native is False
+    assert request.payload["stop"] == ["here"]
+
+    prompt.options.model_dump.return_value = {"temperature": 1.5}
+    request = vlm_model._prepare_chat_request(prompt, stream=True)
+    assert request.native is False
+    assert request.payload["temperature"] == 1.5
+
+
+def test_native_non_streaming_response_records_output_and_usage(monkeypatch, vlm_model):
+    monkeypatch.setattr(vlm_model, "_is_model_loaded", lambda: True)
+    payload = {
+        "model_instance_id": "resolved-model",
+        "output": [
+            {"type": "reasoning", "content": "Think"},
+            {"type": "message", "content": "Done"},
+        ],
+        "stats": {
+            "input_tokens": 42,
+            "total_output_tokens": 5,
+            "reasoning_output_tokens": 2,
+        },
+    }
+    http_response = MagicMock()
+    http_response.json.return_value = payload
+    post = MagicMock(return_value=http_response)
+    monkeypatch.setattr(llm_lmstudio.requests, "post", post)
+    prompt = SimpleNamespace(
+        messages=[llm.user("Hello")], options=None, schema=None, tools=[]
+    )
+    response = MagicMock()
+
+    events = list(vlm_model.execute(prompt, False, response))
+
+    assert [(event.type, event.chunk) for event in events] == [
+        ("reasoning", "Think"),
+        ("text", "Done"),
+    ]
+    assert post.call_args.args[0] == "http://localhost:1234/api/v1/chat"
+    assert response.response_json == payload
+    response.set_resolved_model.assert_called_once_with("resolved-model")
+    response.set_usage.assert_called_once_with(
+        input=42, output=5, details={"reasoning_output_tokens": 2}
+    )
+    http_response.close.assert_called_once()
+
+
+def test_native_stream_error_is_reported(vlm_model):
+    state = llm_lmstudio.NativeStreamState()
+    with pytest.raises(llm.ModelError, match="Model unavailable"):
+        list(
+            vlm_model._process_native_stream_line(
+                'data: {"type":"error","error":{"message":"Model unavailable"}}',
+                state,
+            )
+        )
+
+
+def test_native_prompt_progress_is_visible_on_terminal(monkeypatch, vlm_model):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    terminal = Terminal()
+    monkeypatch.setattr(llm_lmstudio.sys, "stderr", terminal)
+    state = llm_lmstudio.NativeStreamState()
+
+    for progress in (0, 0.5, 0.5, 1):
+        list(
+            vlm_model._process_native_stream_line(
+                f'data: {{"type":"prompt_processing.progress","progress":{progress}}}',
+                state,
+            )
+        )
+    list(
+        vlm_model._process_native_stream_line(
+            'data: {"type":"prompt_processing.end"}', state
+        )
+    )
+
+    assert terminal.getvalue().count("50%") == 1
+    assert "100%" in terminal.getvalue()
+    assert terminal.getvalue().endswith("\n")
 
 
 def test_prepare_chat_request_for_schema_forces_non_streaming(
@@ -878,6 +1023,9 @@ def test_three_step_tool_chain_sends_one_system_message(monkeypatch, vlm_model):
 
         def json(self):
             return self._payload
+
+        def close(self):
+            pass
 
     def fake_post(url, json=None, stream=False, timeout=None):
         requests_sent.append(json)
